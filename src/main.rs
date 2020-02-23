@@ -3,6 +3,8 @@ use clap::{App, AppSettings, Arg, SubCommand};
 use std::fs::{self, DirEntry};
 use std::io;
 use std::path::Path;
+use std::sync::mpsc::channel;
+use std::thread;
 
 fn main() {
     let verbose_arg = Arg::with_name("verbose")
@@ -43,24 +45,32 @@ fn main() {
 
         run_rm_cmd(&vals, verbose)
     }
+}
 
-    fn run_rm_cmd(targets: &Vec<&Path>, verbose: bool) {
-        for path in targets {
-            println!(
-                "{:?} - exists: {}, isdir: {}, isfile: {}",
-                path.to_str(),
-                path.exists(),
-                path.is_dir(),
-                path.is_file()
-            )
+fn run_rm_cmd(targets: &Vec<&Path>, _verbose: bool) {
+    let (tx, rx) = channel();
 
-            if (path.is_dir()) {
-                visit_dirs(dir: &Path, cb: &dyn Fn(&DirEntry))
-            }
+    for path in targets {
+        println!(
+            "{:?} - exists: {}, isdir: {}, isfile: {}",
+            path.to_str(),
+            path.exists(),
+            path.is_dir(),
+            path.is_file()
+        );
+
+        if path.is_dir() {
+            visit_dirs(&path, &|file| {
+                tx.send(file.path()).unwrap();
+            })
+            .unwrap();
         }
     }
-
-    // more program logic goes here...
+    // tx.send(None);
+    drop(tx);
+    rx.iter().for_each(|file| {
+        println!("{:?}", file.to_str());
+    });
 }
 
 fn visit_dirs(dir: &Path, cb: &dyn Fn(&DirEntry)) -> io::Result<()> {
@@ -68,9 +78,11 @@ fn visit_dirs(dir: &Path, cb: &dyn Fn(&DirEntry)) -> io::Result<()> {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
+
             if path.is_dir() {
                 visit_dirs(&path, cb)?;
-            } else {
+            }
+            if path.is_file() {
                 cb(&entry);
             }
         }
