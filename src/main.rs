@@ -1,10 +1,11 @@
 extern crate clap;
 use clap::{App, AppSettings, Arg, SubCommand};
-use std::fs::{self, DirEntry};
-use std::io;
+use std::error;
+use std::fs;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::mpsc::channel;
-use std::thread;
+use threadpool::ThreadPool;
 
 fn main() {
     let verbose_arg = Arg::with_name("verbose")
@@ -43,49 +44,122 @@ fn main() {
     if let Some(matches) = matches.subcommand_matches("rm") {
         let vals: Vec<&Path> = matches.values_of("FILE").unwrap().map(Path::new).collect();
 
-        run_rm_cmd(&vals, verbose)
+        let run_cmd_result = run_rm_cmd(&vals, verbose);
+
+        if let Err(error) = run_cmd_result {
+            println!("{:?}: {}", std::env::current_exe(), error);
+            std::process::exit(1);
+        }
+        // let f = match result {
+        //     Ok(result) => file,
+        //     Err(error) => panic!("Problem opening the file: {:?}", error),
+        // };
+    }
+    if let Some(matches) = matches.subcommand_matches("cp") {
+        let vals: Vec<&Path> = matches.values_of("FILE").unwrap().map(Path::new).collect();
+
+        let _result = run_cp_cmd(&vals, verbose);
     }
 }
 
-fn run_rm_cmd(targets: &Vec<&Path>, _verbose: bool) {
-    let (tx, rx) = channel();
+type Result<T> = std::result::Result<T, Box<dyn error::Error>>;
+
+fn run_cp_cmd(_targets: &Vec<&Path>, _verbose: bool) {
+    panic!("")
+}
+
+fn run_rm_cmd(targets: &Vec<&Path>, _verbose: bool) -> Result<()> {
+    let (files_to_delete_tx, files_to_delete_rx) = channel();
+    let (dir_to_delete_tx, dir_to_delete_rx) = channel();
+
+    let n_workers = 8;
+    let thread_pool = ThreadPool::new(n_workers);
 
     for path in targets {
-        println!(
-            "{:?} - exists: {}, isdir: {}, isfile: {}",
-            path.to_str(),
-            path.exists(),
-            path.is_dir(),
-            path.is_file()
-        );
-
-        if path.is_dir() {
-            visit_dirs(&path, &|file| {
-                tx.send(file.path()).unwrap();
-            })
-            .unwrap();
+        if !path.exists() {
+            //return Err(());
+        }
+        let path_can = fs::canonicalize(path)?;
+        if path_can.is_dir() {
+            dir_to_delete_tx.send(fs::canonicalize(path)?)?;
+            visit_dirs(&path_can, thread_pool.clone(), files_to_delete_tx.clone())?;
+        } else {
+            files_to_delete_tx.send(path.to_path_buf())?;
         }
     }
-    // tx.send(None);
-    drop(tx);
-    rx.iter().for_each(|file| {
-        println!("{:?}", file.to_str());
+    drop(files_to_delete_tx);
+    drop(dir_to_delete_tx);
+
+    files_to_delete_rx.iter().for_each(|file| {
+        thread_pool.execute(move || {
+            let path_str = file.to_str();
+
+            match path_str {
+                Some(path_str) => {
+                    println!("file: {}", path_str);
+                    let remove_result = fs::remove_file(&file);
+                    if let Err(error) = remove_result {
+                        println!("{} - {}", path_str, error);
+                        std::process::exit(2);
+                    };
+                }
+                None => {}
+            };
+        });
     });
+
+    dir_to_delete_rx.iter().for_each(|dir| {
+        thread_pool.execute(move || {
+            let path_str = dir.to_str();
+
+            match path_str {
+                Some(path_str) => {
+                    println!("dir: {}", path_str);
+                }
+                None => {}
+            };
+        })
+    });
+
+    thread_pool.join();
+
+    println!();
+    println!();
+    println!();
+    println!();
+    println!();
+    return Ok(());
 }
 
-fn visit_dirs(dir: &Path, cb: &dyn Fn(&DirEntry)) -> io::Result<()> {
-    if dir.is_dir() {
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
+fn visit_dirs(
+    dir_str: &PathBuf,
+    pool: ThreadPool,
+    cb: std::sync::mpsc::Sender<PathBuf>,
+) -> Result<()> {
+    let dir = Path::new(dir_str);
 
-            if path.is_dir() {
-                visit_dirs(&path, cb)?;
-            }
-            if path.is_file() {
-                cb(&entry);
-            }
+    if !dir.is_dir() {
+        panic!("")
+    }
+
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+
+        let path_buf = entry.path();
+        let path = path_buf.as_path();
+
+        let full_path_buf = fs::canonicalize(&path_buf)?;
+        if path.is_dir() {
+            let files_tx = cb.clone();
+            let moveed_pool = pool.clone();
+            pool.execute(move || {
+                visit_dirs(&full_path_buf, moveed_pool, files_tx).unwrap();
+            });
+        } else if path.is_file() {
+            let file_full_path_buf = fs::canonicalize(&path_buf)?;
+            cb.send(file_full_path_buf)?;
         }
     }
+
     Ok(())
 }
